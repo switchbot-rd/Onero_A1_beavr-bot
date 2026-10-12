@@ -59,6 +59,19 @@ XARM_HOME_SUBSCRIBE_PORT = 10007
 XARM_STATE_PUBLISH_PORT = 10016
 XARM_TELEOPERATION_STATE_PORT = 8089
 
+# Onero A1 arm specific ports.
+# Mirrors the XArm layout: subscribe sits one *below* publish so the left arm can
+# use a +2 offset (see OneroA1Config) without colliding with the right arm.
+# RESET shares the endeff subscribe port -- the reset command arrives as a
+# separate topic on the same socket.
+ONERO_HOME_SUBSCRIBE_PORT = 10028
+ONERO_ENDEFF_SUBSCRIBE_PORT = 10030  # operator -> robot ("endeff_coords")
+ONERO_ENDEFF_PUBLISH_PORT = 10031  # robot -> operator ("endeff_homo")
+ONERO_RESET_SUBSCRIBE_PORT = 10030  # same socket as endeff, distinct topic
+ONERO_JOINT_SUBSCRIBE_PORT = 10049
+ONERO_STATE_PUBLISH_PORT = 10037
+ONERO_TELEOPERATION_STATE_PORT = 10038  # shared by both arms (global pause)
+
 # Leap hand specific ports
 LEAP_JOINT_ANGLE_SUBSCRIBE_PORT = 8120
 LEAP_JOINT_ANGLE_PUBLISH_PORT = 8119

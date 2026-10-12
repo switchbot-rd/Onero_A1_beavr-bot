@@ -169,6 +169,11 @@ def _patch_messaging_layer(monkeypatch):
         raising=False,
     )
     monkeypatch.setattr(
+        "beavr.teleop.components.interface.robots.onero_robot.ZMQSubscriber",
+        FakeZMQSubscriber,
+        raising=False,
+    )
+    monkeypatch.setattr(
         "beavr.teleop.components.detector.vr.keypoint_transform.ZMQSubscriber",
         FakeZMQSubscriber,
         raising=False,

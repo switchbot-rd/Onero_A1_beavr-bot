@@ -49,7 +49,7 @@ What your example command means:
 
 ---
 
-## 2) Robot configs: `leap_config.py` and `xarm7_config.py`
+## 2) Robot configs: `leap_config.py`, `xarm7_config.py` and `onero_config.py`
 
 Both files follow the same pattern:
 - Small dataclasses that describe component configuration for a robot:

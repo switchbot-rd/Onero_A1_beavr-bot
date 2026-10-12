@@ -81,6 +81,9 @@ dependencies = [
     "xarm-python-sdk",
     "dynamixel-sdk",
     "flatbuffers>=25.9.23,<26.0.0",
+    # Onero A1 arms (SocketCAN). The [ik] extra pulls in pinocchio + pink,
+    # required by Arm.servop() used for real-time Cartesian teleoperation.
+    "onero-sdk[ik]>=0.3.0",
 ]
 
 [project.optional-dependencies]

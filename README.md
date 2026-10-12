@@ -35,7 +35,7 @@ BeaVR is an open-source, end-to-end teleoperation pipeline that leverages afford
 
 Key features:
 - **VR teleoperation out-of-the-box** – Stream low-latency control and visual feedback through Meta Quest 3 (and any OculusVR supported device) while recording synchronized proprioceptive, visual, and action data.
-- **Multi-embodiment support** – Ships with drivers and URDF assets for the RX-1 full-size humanoid and an xArm + LeapHand dexterous work-cell. The modular hardware abstraction layer lets you drop in new robots with a single interface file.
+- **Multi-embodiment support** – Ships with drivers and URDF assets for the RX-1 full-size humanoid, an xArm + LeapHand dexterous work-cell, and the Onero A1 arm. The modular hardware abstraction layer lets you drop in new robots with a single interface file.
 - **Simulation parity** – Mirror every real-world session in MuJoCo or Isaac Gym for rapid domain-randomized policy training or sim-to-real transfer.
 - **Dexterous demonstration collection** – Capture single-hand, bi-manual, or whole-body demonstrations for manipulation, assembly, or locomotion tasks—no motion-capture stage required.
 - **Budget-friendly extensibility** – Works on commodity PCs and laptops with accessible robotics hardware.

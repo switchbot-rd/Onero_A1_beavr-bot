@@ -6,6 +6,8 @@ numpy
 scipy>=1.15.2
 pyzmq>=26.2.1
 opencv-python-headless>=4.9.0
+# Pulled in by the robot config registry (shared visualizer components)
+matplotlib>=3.8.2
 
 # Test tools
 pytest>=8.1.0
