@@ -88,6 +88,20 @@ The remaining notes are about correctness rather than startup:
   per-joint.** The calibrated values `(150, 150, 150, 150, 40, 40, 40)` /
   `(4, 4, 4, 4, 1, 1, 1)` already exist in the SDK registry but are unreachable
   from its servo entry points; per-joint support there is the actual fix.
+- **The SDK's 0.02 rad joint-limit tolerance is widened to 0.1 rad** — see
+  `OneroRobot._relax_ik_tolerances` and `ONERO_IK_LIMIT_OVERSHOOT_RAD`.
+  `servop` re-seeds its IK from the *measured* joints every tick, and
+  `IKSolver.reset` refuses feedback that sits more than 0.02 rad outside the URDF
+  range. Servo sag at the edge of the workspace exceeds that: measured 0.0297 rad
+  (left) and 0.0335 rad (right), after which `servop` refused every target and
+  both arms stayed frozen for ~60 s (1741 consecutive frames) until restart — the
+  arm cannot move itself back inside the limit while every command is refused.
+  The solver still projects its warm start back inside the limits, so widening
+  only removes the deadlock; it does not let the arm drive further.
+  Do **not** widen the *convergence* tolerances instead: an unreachable target
+  then counts as solved, that pose becomes the next step-clamp baseline, and the
+  arm parks at the workspace edge and stops responding (measured: one "holding at
+  the limit" line per second for the rest of the session).
 - Model, mounting and world-frame options live in `configs/robots/onero_config.py`
   (`OneroRobotCfg`) and in `configs/constants/robots.py`.
 - **The VR→robot calibration is derived at teleop reset, not configured.**

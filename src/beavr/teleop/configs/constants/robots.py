@@ -153,6 +153,16 @@ ONERO_LEFT_DEFAULT_MOUNTING = "humanoid_left"
 # this True on a gripper-less arm.
 ONERO_DEFAULT_WITH_GRIPPER = True
 
+# How far the *measured* joints may sit past a URDF limit before the SDK's IK
+# refuses to run. The SDK hard-codes 0.02 rad, which is below the servo lag and
+# gravity sag seen at the edge of the workspace: measured on the A1 cell at
+# 0.0297 rad (left) and 0.0335 rad (right), and both arms then refused every
+# target for ~60 s (1741 frames) because a refused `servop` cannot move the arm
+# back inside the limit by itself. Single source of truth: `OneroRobot` passes it
+# to the solver and `check_onero_joint_limits` uses the same value, so the
+# diagnostic never disagrees with the teleoperation it is predicting.
+ONERO_IK_LIMIT_OVERSHOOT_RAD = 0.1
+
 # A safe "park" pose for the right arm on the cell this repo was developed
 # against, in degrees, in SDK joint order.
 #

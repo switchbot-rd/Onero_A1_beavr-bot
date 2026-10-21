@@ -1,10 +1,9 @@
 """Read-only joint-limit check for Onero A1 arms.
 
-Teleoperation refuses to start when a measured joint sits outside the URDF
-limits by more than the servo-settling tolerance, and the error names only the
-largest violation:
+A joint sitting far outside the URDF limits makes every servo target fail, and
+the SDK's error names only the largest violation:
 
-    ValueError: IK feedback exceeds URDF limits by 0.165727 rad (tolerance 0.02)
+    ValueError: IK feedback exceeds URDF limits by 0.165727 rad (tolerance 0.1)
 
 This script prints every joint next to its limits so the offending axis is
 visible before starting teleop. It only reads feedback: it does not enable the
@@ -23,8 +22,11 @@ import numpy as np
 from beavr.teleop.common.configs.loader import Laterality
 from beavr.teleop.configs.constants import robots
 
-# Same tolerance the SDK's IK reset applies before it refuses feedback.
-OVERSHOOT_TOLERANCE = 0.02
+# The tolerance teleoperation actually runs with. Imported from the shared
+# constant rather than hard-coded, so this check cannot claim an arm would be
+# refused while `OneroRobot` happily accepts it (the SDK's own 0.02 rad default
+# is lower than the servo sag seen at the edge of the workspace).
+OVERSHOOT_TOLERANCE = robots.ONERO_IK_LIMIT_OVERSHOOT_RAD
 
 
 def _side_config(laterality: Laterality):

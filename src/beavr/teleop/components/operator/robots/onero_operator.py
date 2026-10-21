@@ -178,6 +178,9 @@ class OneroOperator(XArmOperator):
 
         self._gripper_command_port = gripper_command_port
         self._gripper_is_closed = False
+        self._pinch_history: list[float] = []
+        self._pinch_open_streak = 0
+        self._pinch_close_streak = 0
         self._raw_keypoints_subscriber = None
         self._gripper_publisher = ZMQPublisherManager.get_instance()
         if gripper_command_port is not None:
@@ -189,22 +192,41 @@ class OneroOperator(XArmOperator):
             )
 
         # Start gate ------------------------------------------------------------------
-        # The inherited pipeline boots straight into ARM_TELEOP_CONT, and the onero
-        # config used to point the pause subscriber at 10038, which nothing publishes
-        # to, so the arm started tracking as soon as the components came up.
+        # The inherited pipeline boots straight into ARM_TELEOP_CONT, and the App
+        # starts pushing keypoints as soon as its sockets come up -- before anyone
+        # presses Start. The gate reuses the pause subscriber the parent already
+        # created (the onero config points it at the detector's port), boots in
+        # STOP, and opens only on the App's continue code.
         #
-        # The gate reuses the pause subscriber the parent already created (the onero
-        # config points it at the detector's port), starts in STOP, and opens only on
-        # the App's continue signal. It is opt-in: the app does not always push that
-        # signal -- on this rig nothing ever connected to port 8100, so the operator
-        # sat in STOP forever and the arm never moved.
+        # OneroVRHandDetector publishes the App's inverted codes ("High" ->
+        # "pause"), so the command that means *continue* is ``_start_command``.
+        # Set ONERO_START_COMMAND=resume if a rig reports the opposite.
         #
-        # oculus.py inverts the App's codes ("Low" -> "resume", anything else ->
-        # "pause") while the App sends "High" for *continue*. That is why the start
-        # command defaults to "pause"; set ONERO_START_COMMAND=resume if a rig
-        # reports the opposite.
-        self._require_start = os.environ.get("ONERO_REQUIRE_START", "0") != "0"
+        # The gate used to be opt-in: on this rig the pause channel looked dead and
+        # the operator sat in STOP forever. The real cause was the detector
+        # rejecting every pause payload as a malformed keypoint frame (fixed in
+        # OneroVRHandDetector._receive_data). What software cannot fix is a pause
+        # socket pointed at the wrong port; ``_start_fallback`` covers that case by
+        # opening the gate on a keypoint-only stream once the pause channel has been
+        # silent for ``_start_fallback_s``. It is off by default: the guarantee that
+        # nothing moves before Start has to hold unconditionally, and a misrouted
+        # pause port is a configuration fault that ``ss -tnp`` shows directly.
+        self._require_start = os.environ.get("ONERO_REQUIRE_START", "1") != "0"
         self._start_command = os.environ.get("ONERO_START_COMMAND", robots.PAUSE)
+        self._start_fallback = os.environ.get("ONERO_START_FALLBACK", "0") != "0"
+        try:
+            self._start_fallback_s = float(os.environ.get("ONERO_START_FALLBACK_S", "8"))
+        except ValueError:
+            # A typo in the override must not take the operator down at start-up.
+            self._start_fallback_s = 8.0
+        self._start_t0 = time.time()
+        self._pause_last_rx = 0.0
+        self._pause_last_stamp: Optional[float] = None
+        self._fallback_warned = False
+        # Memo for the current loop turn: the pause subscriber only reports one
+        # message, so the gate decision is taken once per turn and reused by the
+        # inherited pipeline instead of being re-derived from a stale cache.
+        self._cycle_state: Optional[int] = None
         if self._require_start and self._arm_teleop_state_subscriber is not None:
             self.arm_teleop_state = robots.ARM_TELEOP_STOP
             logger.info(
@@ -225,6 +247,10 @@ class OneroOperator(XArmOperator):
         The inherited implementation is identical apart from the code mapping: the
         detector republishes the App's inverted codes, so the command that means
         *continue* arrives as ``_start_command``.
+
+        OneroVRHandDetector only forwards the App's two state payloads, so every
+        command that arrives here is meaningful; anything else is dropped upstream
+        and leaves the state untouched.
         """
         if (
             not self._require_start
@@ -232,16 +258,79 @@ class OneroOperator(XArmOperator):
         ):
             return super()._get_arm_teleop_state()
 
+        if self._cycle_state is not None:
+            return self._cycle_state
+
         data = self._arm_teleop_state_subscriber.recv_keypoints()
-        if data is None:
+        command = getattr(data, "command", None) if data is not None else None
+        state = self.arm_teleop_state
+        if command is not None:
+            # ``recv_keypoints`` hands back the cached latest frame, so the same
+            # message is re-read on every loop: only a timestamp change is news.
+            stamp = getattr(data, "timestamp_s", None)
+            if stamp != self._pause_last_stamp:
+                self._pause_last_stamp = stamp
+                self._pause_last_rx = time.time()
+                if command == self._start_command:
+                    state = robots.ARM_TELEOP_CONT
+                elif command in (robots.PAUSE, robots.RESUME):
+                    state = robots.ARM_TELEOP_STOP
+
+        if state == self.arm_teleop_state:
+            state = self._fallback_teleop_state()
+
+        self._cycle_state = state
+        return state
+
+    def _fallback_teleop_state(self) -> int:
+        """Hold STOP unless the start channel is provably missing.
+
+        A live pause channel always wins, including a stream of "still paused"
+        codes: that is the App sitting on the menu, not a fault. The fallback only
+        engages when no pause traffic has arrived for ``_start_fallback_s`` while
+        hand frames keep coming -- i.e. the App is pushing but its start signal
+        cannot reach this host.
+        """
+        if not self._start_fallback:
             return self.arm_teleop_state
 
-        command = getattr(data, "command", None)
-        if command == self._start_command:
-            return robots.ARM_TELEOP_CONT
-        if command in (robots.PAUSE, robots.RESUME):
-            return robots.ARM_TELEOP_STOP
-        return self.arm_teleop_state
+        now = time.time()
+        if self._pause_last_rx and now - self._pause_last_rx < self._start_fallback_s:
+            return self.arm_teleop_state
+        if now - self._start_t0 < self._start_fallback_s:
+            return self.arm_teleop_state
+        if not self._hand_stream_alive():
+            return self.arm_teleop_state
+
+        if not self._fallback_warned:
+            self._fallback_warned = True
+            logger.warning(
+                "[%s] no pause-channel traffic for %.0fs while hand frames keep "
+                "arriving: the App's start signal cannot reach this host (check the "
+                "pause port mapping). Falling back to the keypoint stream so teleop "
+                "stays usable; set ONERO_START_FALLBACK=0 to require the gate.",
+                self.operator_name,
+                self._start_fallback_s,
+            )
+        return robots.ARM_TELEOP_CONT
+
+    def _hand_stream_alive(self) -> bool:
+        """Whether the App is pushing tracked hand frames right now."""
+        if self._raw_keypoints_subscriber is None:
+            return False
+        frame = self._raw_keypoints_subscriber.recv_keypoints()
+        keypoints = getattr(frame, "keypoints", None)
+        if keypoints is None:
+            return False
+        try:
+            joints = np.asarray(keypoints, dtype=float).reshape(-1, 3)
+        except (TypeError, ValueError):
+            return False
+        if joints.size == 0:
+            return False
+        # Untracked joints stream as the origin; any tracked joint proves the App
+        # is pushing and the headset still sees the hand.
+        return bool(np.any(joints))
 
     # -----------------------------------------------------------------------------
     # Gripper
@@ -252,30 +341,134 @@ class OneroOperator(XArmOperator):
     # state, which is exactly what a gripper trigger must not do.
     #
     # Thresholds are wider than the App's 0.02 m index threshold because the little
-    # finger is short and the reachable pinch gap is smaller. Tune them on the rig:
-    # too tight -> never closes, too loose -> closes at rest.
-    _PINCH_CLOSE_M = 0.03
-    _PINCH_OPEN_M = 0.05
+    # finger is short and the reachable pinch gap is smaller.
+    #
+    # Tuned on the rig. At some hand angles -- palm rotated away from the headset,
+    # little finger partly occluded -- tracking reports the two tips further apart
+    # than they physically are, and a 0.03 m close threshold simply never fired:
+    # the tips were touching while the estimated span read ~0.04 m. 0.045 m closes
+    # reliably at every angle tested. The open threshold keeps the same 0.02 m
+    # hysteresis band, and a resting hand measures ~0.08-0.10 m, so the wider band
+    # still does not close on its own.
+    # Re-tune on the rig: too tight -> never closes, too loose -> closes at rest.
+    _PINCH_CLOSE_M = 0.045
+    _PINCH_OPEN_M = 0.065
     _THUMB_TIP_IDX = 5
     _PINKY_TIP_IDX = 25
+    # Debounce. Headset hand tracking jitters while the hand moves: the
+    # thumb/pinky span briefly reads wide for a single frame, which used to open
+    # the gripper in the middle of a pinch and drop whatever it held. Median over
+    # three samples kills a lone spike, and a state change additionally needs the
+    # condition to hold for consecutive frames. Opening needs more evidence than
+    # closing because an accidental open is the disruptive direction.
+    _PINCH_MEDIAN_WINDOW = 3
+    _PINCH_OPEN_FRAMES = 3
+    _PINCH_CLOSE_FRAMES = 2
 
     def _apply_retargeted_angles(self):
-        """Run the inherited retargeting, then refresh the gripper state."""
+        """Run the inherited retargeting, then refresh the gripper state.
+
+        While the start gate is closed the inherited pipeline is skipped entirely.
+        That is about more than publishing: its reset branch blocks until a hand
+        frame arrives and rebaselines the hand-to-arm mapping, so running it on the
+        menu screen printed ``RESETTING TELEOP`` at launch, captured a baseline with
+        the hand wherever it happened to be, and then captured a second one after
+        Start. Holding ``is_first_frame`` instead means the one and only reset
+        happens on the first CONT frame, with the hand placed as the operator
+        intends.
+        """
         # Diagnostic counters (ONERO_TELEOP_DEBUG=1): _entered counts loop turns,
         # _completed counts turns where the inherited pipeline actually returned.
         # A growing gap between them means the shared pipeline is blocking, which
         # is exactly how a missing subscription looks from the outside: no logs,
         # no commands, and a live process.
         self._entered += 1
-        super()._apply_retargeted_angles()
-        self._completed += 1
-        # Report before the gripper step so a future stall in the gripper path
-        # shows up as completed growing while the log keeps ticking.
-        self._debug_report()
-        self._update_gripper()
+        self._cycle_state = None
+        try:
+            if self._require_start and self._get_arm_teleop_state() == robots.ARM_TELEOP_STOP:
+                # Gate closed: no reset, no command. The gripper keeps working --
+                # it is a separate effector and behaves the same way when the App
+                # pauses -- so its state stays in sync with the hardware.
+                self.arm_teleop_state = robots.ARM_TELEOP_STOP
+                self.is_first_frame = True
+                self._completed += 1
+                self._debug_report()
+                self._update_gripper()
+                return
+
+            super()._apply_retargeted_angles()
+            self._completed += 1
+            # Report before the gripper step so a future stall in the gripper path
+            # shows up as completed growing while the log keeps ticking.
+            self._debug_report()
+            self._update_gripper()
+        finally:
+            self._cycle_state = None
+
+    def _pinch_distance(self, keypoints: np.ndarray) -> Optional[float]:
+        """Thumb-to-pinky tip span in metres, or ``None`` when a tip is missing.
+
+        Both tips must be present. A joint the headset failed to track streams as
+        the origin, so measuring the span against it yields the distance to the
+        wrist-frame origin -- 5 to 10 cm, i.e. "fingers far apart". That is what
+        used to open the gripper mid-pinch whenever tracking dropped a fingertip
+        while the hand was moving.
+        """
+        if keypoints.shape[0] <= self._PINKY_TIP_IDX:
+            return None
+        thumb = keypoints[self._THUMB_TIP_IDX]
+        pinky = keypoints[self._PINKY_TIP_IDX]
+        if not np.isfinite(thumb).all() or not np.isfinite(pinky).all():
+            return None
+        if not thumb.any() or not pinky.any():
+            return None
+        return float(np.linalg.norm(thumb - pinky))
+
+    def _classify_pinch(self, distance: float) -> Optional[bool]:
+        """Decide the gripper state from one distance sample.
+
+        Returns the new state, or ``None`` when it should not change. The
+        hysteresis band (``_PINCH_CLOSE_M`` .. ``_PINCH_OPEN_M``) stops a hand
+        resting between the thresholds from oscillating; the median and the
+        consecutive-frame requirement reject the single-frame spikes that hand
+        tracking produces while the hand moves.
+        """
+        self._pinch_history.append(distance)
+        if len(self._pinch_history) > self._PINCH_MEDIAN_WINDOW:
+            self._pinch_history.pop(0)
+        # Median over whatever has arrived: waiting for a full window would add
+        # two frames of latency to the first pinch after start-up.
+        filtered = float(np.median(self._pinch_history))
+
+        if filtered < self._PINCH_CLOSE_M:
+            self._pinch_close_streak += 1
+            self._pinch_open_streak = 0
+            if self._pinch_close_streak < self._PINCH_CLOSE_FRAMES:
+                return None
+            wanted_closed = True
+        elif filtered > self._PINCH_OPEN_M:
+            self._pinch_open_streak += 1
+            self._pinch_close_streak = 0
+            if self._pinch_open_streak < self._PINCH_OPEN_FRAMES:
+                return None
+            wanted_closed = False
+        else:
+            self._pinch_close_streak = 0
+            self._pinch_open_streak = 0
+            return None
+
+        if wanted_closed == self._gripper_is_closed:
+            return None
+        return wanted_closed
 
     def _update_gripper(self):
-        """Map thumb/index distance to a two-state gripper command."""
+        """Map this hand's thumb/pinky distance to a two-state gripper command.
+
+        Each operator reads its own hand: the right operator drives the right
+        gripper from the right hand, the left operator the left one. The pinky
+        is used instead of the index finger because thumb+index/middle/ring are
+        already the App's mode-switch gestures.
+        """
         if self._raw_keypoints_subscriber is None:
             return
 
@@ -289,24 +482,15 @@ class OneroOperator(XArmOperator):
         self._kp_frames += 1
 
         keypoints = np.asarray(frame.keypoints, dtype=float).reshape(-1, 3)
-        if keypoints.shape[0] <= self._PINKY_TIP_IDX:
+        distance = self._pinch_distance(keypoints)
+        if distance is None:
+            # Hand, or one of the two tips, was not tracked. Hold the last state
+            # and keep it out of the history: a dropped joint reads as zero and
+            # would otherwise poison the median.
             return
 
-        thumb = keypoints[self._THUMB_TIP_IDX]
-        pinky = keypoints[self._PINKY_TIP_IDX]
-        if not np.isfinite(thumb).all() or not np.isfinite(pinky).all():
-            return
-        if not thumb.any() and not pinky.any():
-            # Hand not tracked: the App keeps streaming zeros. Hold the last
-            # state instead of forcing the gripper open.
-            return
-
-        distance = float(np.linalg.norm(thumb - pinky))
-        if not self._gripper_is_closed and distance < self._PINCH_CLOSE_M:
-            wanted_closed = True
-        elif self._gripper_is_closed and distance > self._PINCH_OPEN_M:
-            wanted_closed = False
-        else:
+        wanted_closed = self._classify_pinch(distance)
+        if wanted_closed is None:
             return
 
         self._gripper_is_closed = wanted_closed

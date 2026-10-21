@@ -352,7 +352,8 @@ class OneroA1Config:
                     reset_subscribe_port=ports.ONERO_RESET_SUBSCRIBE_PORT,
                     home_subscribe_port=ports.ONERO_HOME_SUBSCRIBE_PORT,
                     state_publish_port=ports.ONERO_STATE_PUBLISH_PORT,
-                    # See the operator note: pause is intentionally left inert.
+                    # Robot side keeps the legacy port, which nothing publishes on;
+                    # the start gate lives in the operator (see its note).
                     teleoperation_state_port=ports.ONERO_TELEOPERATION_STATE_PORT,
                     hand_side=robots.RIGHT,
                     recorder_config={
@@ -412,8 +413,9 @@ class OneroA1Config:
                     # Point the pause subscriber at the detector's keypoint port:
                     # that is where the App's start/stop signal is republished on
                     # topic "pause". OneroOperator compensates for the detector's
-                    # inverted codes and boots in STOP, so teleop now waits for the
-                    # App's Start button instead of tracking as soon as it launches.
+                    # inverted codes, boots in STOP and opens only on the App's
+                    # continue code, so teleop waits for the App's Start button
+                    # instead of tracking as soon as frames arrive.
                     teleoperation_state_port=ports.KEYPOINT_STREAM_PORT,
                     hand_side=robots.RIGHT,
                     gripper_command_port=10040,

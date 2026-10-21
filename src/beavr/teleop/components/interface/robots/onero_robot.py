@@ -95,6 +95,9 @@ class OneroRobot(RobotWrapper):
         max_step_rotation_rad: float = 0.5,
         kp: Optional[float] = None,
         kd: Optional[float] = None,
+        ik_limit_overshoot_rad: float = robots.ONERO_IK_LIMIT_OVERSHOOT_RAD,
+        ik_pos_tol_m: float = 1e-4,
+        ik_rot_tol_rad: float = 1e-3,
         arm: Any = None,
         **kwargs,
     ):
@@ -155,6 +158,16 @@ class OneroRobot(RobotWrapper):
                 "Servo tracking lag").
             kd: Damping gain forwarded to the SDK servo. ``None`` keeps the SDK
                 default (``1.0``).
+            ik_limit_overshoot_rad: How far the *measured* joints may sit past a
+                URDF limit before the SDK's IK refuses to run. The SDK default
+                (0.02 rad) is below the servo lag and gravity sag seen at the
+                edge of the workspace, which deadlocks ``servop``: every target
+                is refused, the arm cannot move back inside the limit by
+                itself, and teleoperation is stuck until a restart.
+            ik_pos_tol_m: IK position tolerance, defaulting to the SDK's 0.1 mm.
+                Do not raise it for teleoperation: an unreachable target then
+                counts as converged and becomes the next step-clamp baseline.
+            ik_rot_tol_rad: IK rotation tolerance, defaulting to the SDK's 1 mrad.
             arm: Optional pre-built SDK arm; when omitted the SDK creates one.
         """
         self._can_channel = can_channel
@@ -192,11 +205,27 @@ class OneroRobot(RobotWrapper):
         self._max_step_rotation_rad = max_step_rotation_rad
         self._kp = kp
         self._kd = kd
+        self._ik_limit_overshoot_rad = float(ik_limit_overshoot_rad)
+        self._ik_pos_tol_m = float(ik_pos_tol_m)
+        self._ik_rot_tol_rad = float(ik_rot_tol_rad)
         # Consecutive IK failures. The SDK servo path raises when its internal
         # solver cannot reach the target in the allotted iterations; a single
         # unreachable frame must never take the whole component down.
         self._ik_failures = 0
         self._ik_last_log = 0.0
+        # When the current failure streak started, so the throttled warning can
+        # say how long the arm has been holding instead of only how many frames.
+        self._ik_streak_started = 0.0
+        # A hold shorter than this is not worth a warning: the solver refuses a
+        # lone frame near the workspace edge all the time and recovers on its own.
+        self._ik_hold_warn_s = 1.0
+        # Step clamping fires on a large share of frames during normal teleop
+        # (a fast hand rotation exceeds the per-tick limit almost every frame),
+        # so logging every one of them buries real warnings and does string
+        # formatting in the 30 Hz control loop. Report once per axis per window.
+        self._clamp_last_log: dict[str, float] = {}
+        self._clamp_suppressed: dict[str, int] = {}
+        self._clamp_log_interval_s = 1.0
         self._nonfinite_commands = 0
         self._data_frequency = robots.VR_FREQ
         self._recorder_config = kwargs.get("recorder_config", {})
@@ -204,6 +233,9 @@ class OneroRobot(RobotWrapper):
 
         # Hardware handle: injected for tests/simulation, otherwise built below.
         self._arm = arm if arm is not None else self._create_arm()
+        # Do this before the first servo tick: with the SDK defaults, a normal
+        # edge-of-workspace teleop run deadlocks the arm (see the method).
+        self._relax_ik_tolerances()
 
         # Subscribers -----------------------------------------------------------------
         self._cartesian_coords_subscriber = ZMQSubscriber(
@@ -331,6 +363,64 @@ class OneroRobot(RobotWrapper):
         # ``Arm`` does not enable motors implicitly; teleoperation needs them on.
         arm.enable()
         return arm
+
+    def _relax_ik_tolerances(self) -> None:
+        """Widen the SDK's IK joint-limit tolerance, which is too tight for teleop.
+
+        ``Arm.servop`` re-seeds its IK from the measured joints on every tick, and
+        ``IKSolver.reset`` refuses feedback that sits more than 0.02 rad outside
+        the URDF limits. Servo lag and gravity sag exceed that at the edge of the
+        workspace: measured on the A1 cell at 0.0297 rad (left) and 0.0335 rad
+        (right). Once it trips, ``servop`` refuses *every* target, the arm cannot
+        move itself back inside the limit, and both arms stayed dead for ~60 s
+        (1741 consecutive refused frames) until the process was restarted.
+
+        The tolerance is not reachable through ``servop``'s signature, so widen
+        it on this arm's cached solver instance. The limits are still enforced:
+        the solver projects its warm start back inside the URDF range -- the
+        behaviour it already applied to overshoots below 0.02 rad -- so the arm
+        now servos itself back inside the limit instead of deadlocking.
+
+        The IK *convergence* tolerances are pinned to the SDK's current defaults
+        rather than widened: a raised position tolerance makes an unreachable
+        target count as solved, that pose becomes the next step-clamp baseline,
+        and the arm then parks at the workspace edge and stops responding. They
+        are still passed explicitly so a future SDK release cannot change this
+        behaviour silently.
+        """
+        get_ik = getattr(self._arm, "_get_ik", None)
+        if get_ik is None:  # injected mock, or an SDK build without the IK extra
+            return
+        try:
+            ik = get_ik()
+        except Exception as exc:  # pragma: no cover - depends on the SDK install
+            logger.warning(f"{self.name}: could not widen the SDK IK tolerances ({exc})")
+            return
+
+        overshoot = self._ik_limit_overshoot_rad
+        pos_tol = self._ik_pos_tol_m
+        rot_tol = self._ik_rot_tol_rad
+        original_reset = getattr(ik, "reset", None)
+        original_solve = getattr(ik, "solve", None)
+        if original_reset is None or original_solve is None:
+            return
+
+        def reset(q, overshoot_tolerance=overshoot):
+            return original_reset(q, overshoot_tolerance)
+
+        def solve(*args, **kwargs):
+            kwargs.setdefault("pos_tol", pos_tol)
+            kwargs.setdefault("rot_tol", rot_tol)
+            return original_solve(*args, **kwargs)
+
+        ik.reset = reset
+        ik.solve = solve
+        logger.info(
+            f"{self.name}: SDK IK joint-limit overshoot tolerance widened to "
+            f"{np.rad2deg(overshoot):.1f} deg "
+            f"(convergence tolerances left at {pos_tol * 1000:.2f} mm / "
+            f"{np.rad2deg(rot_tol):.2f} deg)"
+        )
 
     def _safe_stop(self):
         """Best-effort stop used on shutdown paths."""
@@ -510,6 +600,12 @@ class OneroRobot(RobotWrapper):
         else:
             self._last_commanded_position = np.asarray(measured[:3], dtype=float)
             self._last_commanded_rotvec = np.asarray(measured[3:], dtype=float)
+
+        # A reset re-baselines tracking, so any hold counter from before it is
+        # stale: carrying it over would report a "recovered after N frames in
+        # Xs" line whose duration spans the reset.
+        self._ik_failures = 0
+        self._ik_streak_started = 0.0
         return state is not None
 
     # ---------------------------------------------------------------------------------
@@ -784,7 +880,6 @@ class OneroRobot(RobotWrapper):
         # large jerky motion. The SDK applies its own joint-space safety limits
         # on top of this.
         clamped_position, clamped_rotvec = self._clamp_step(position, rotvec)
-        target = np.concatenate([clamped_position, clamped_rotvec]).tolist()
 
         # A frame whose target is unreachable (hand driven into the table, past a
         # joint limit, or simply too far in one step) makes the SDK solver raise.
@@ -792,6 +887,13 @@ class OneroRobot(RobotWrapper):
         # restarts from the measured joints every tick, so tracking resumes by
         # itself as soon as the target is reachable again. Never publish the
         # unconverged joint solution -- it is a local optimum, not a safe pose.
+        #
+        # Deliberately no retry with a smaller step here. It was tried: on a real
+        # arm the solver accepts a fraction of an already unreachable target
+        # (position tolerance), that accepted-but-unreachable pose becomes the
+        # next baseline, and every later back-off from it fails too -- the arm
+        # then parks at the boundary and stops responding for good.
+        target = np.concatenate([clamped_position, clamped_rotvec]).tolist()
         try:
             state = self._arm.servop(
                 target,
@@ -800,26 +902,80 @@ class OneroRobot(RobotWrapper):
                 frame=self._command_frame,
             )
         except IKConvergenceError as exc:
-            self._ik_failures += 1
-            now = time.time()
-            if now - self._ik_last_log > 1.0:  # throttle: one line per second
-                self._ik_last_log = now
-                logger.warning(
-                    f"{self.name}: IK failed on {self._ik_failures} consecutive "
-                    f"frame(s), holding last target ({exc}). Target may be out of "
-                    "reach -- move the hand back into the workspace."
-                )
+            self._hold_on_ik_error(
+                exc,
+                "Target may be out of reach -- move the hand back into the workspace.",
+            )
+            return None
+        except ValueError as exc:
+            # ``servop`` re-validates the measured joints against the URDF limits
+            # on every tick. Servo lag and gravity sag push a joint a few
+            # milliradians past a hard limit whenever the arm is driven to the
+            # edge of its workspace, and the SDK raises a plain ValueError for
+            # that. Hold the frame instead of treating it as fatal: it used to
+            # take the whole arm down mid-teleop. The tolerance itself is widened
+            # in ``_relax_ik_tolerances``; anything above it still lands here.
+            # Any other ValueError (wrong joint count, bad argument) propagates.
+            if "URDF limits" not in str(exc):
+                raise
+            self._hold_on_ik_error(
+                exc,
+                "Joint is past its URDF limit -- move the hand back into the workspace.",
+            )
             return None
 
         if self._ik_failures:
-            logger.info(
-                f"{self.name}: IK recovered after {self._ik_failures} failed frame(s)"
-            )
+            held_s = time.time() - self._ik_streak_started if self._ik_streak_started else 0.0
+            # Do not announce a single refused frame that recovered immediately.
+            if held_s >= self._ik_hold_warn_s:
+                logger.info(
+                    f"{self.name}: IK recovered after {self._ik_failures} failed frame(s) "
+                    f"in {held_s:.1f}s"
+                )
             self._ik_failures = 0
+            self._ik_streak_started = 0.0
 
         self._last_commanded_position = clamped_position
         self._last_commanded_rotvec = clamped_rotvec
         return state
+
+    def _hold_on_ik_error(self, exc: Exception, hint: str) -> None:
+        """Count a skipped servo tick, warning only once a hold is sustained.
+
+        A single refused frame is normal near the workspace edge and recovers on
+        the next tick. Only a hold that lasts is worth a warning, and only one
+        line per second of it.
+        """
+        self._ik_failures += 1
+        now = time.time()
+        if self._ik_failures == 1:
+            self._ik_streak_started = now
+        held_s = now - self._ik_streak_started
+        if held_s < self._ik_hold_warn_s:
+            return
+        if now - self._ik_last_log < 1.0:  # throttle: one line per second
+            return
+        self._ik_last_log = now
+        logger.warning(
+            f"{self.name}: IK failed on {self._ik_failures} consecutive "
+            f"frame(s) over {held_s:.1f}s, holding last target ({exc}). {hint}"
+        )
+
+    def _log_clamp(self, axis: str, message: str) -> None:
+        """Report a clamped step at most once per axis per window.
+
+        Every clamped frame increments a counter; the counter is flushed with
+        the next emitted line so the rate stays visible without the flood.
+        """
+        self._clamp_suppressed[axis] = self._clamp_suppressed.get(axis, 0) + 1
+        now = time.time()
+        if now - self._clamp_last_log.get(axis, 0.0) < self._clamp_log_interval_s:
+            return
+        self._clamp_last_log[axis] = now
+        suppressed = self._clamp_suppressed[axis]
+        self._clamp_suppressed[axis] = 0
+        suffix = f" [{suppressed} frames clamped]" if suppressed > 1 else ""
+        logger.warning(f"{message}{suffix}")
 
     def _clamp_step(self, position: np.ndarray, rotvec: np.ndarray):
         last_position = getattr(self, "_last_commanded_position", None)
@@ -830,9 +986,10 @@ class OneroRobot(RobotWrapper):
         position_delta = position - last_position
         distance = float(np.linalg.norm(position_delta))
         if distance > self._max_step_distance_m > 0:
-            logger.warning(
+            self._log_clamp(
+                "position",
                 f"{self.name}: clamped {distance * 1000:.1f} mm command step "
-                f"to {self._max_step_distance_m * 1000:.1f} mm"
+                f"to {self._max_step_distance_m * 1000:.1f} mm",
             )
             position = last_position + position_delta * (self._max_step_distance_m / distance)
 
@@ -845,9 +1002,10 @@ class OneroRobot(RobotWrapper):
         delta_rotation = Rotation.from_rotvec(rotvec) * previous_rotation.inv()
         angle = float(delta_rotation.magnitude())  # shortest angle, in [0, pi]
         if angle > self._max_step_rotation_rad > 0:
-            logger.warning(
+            self._log_clamp(
+                "rotation",
                 f"{self.name}: clamped {np.rad2deg(angle):.1f} deg command step "
-                f"to {np.rad2deg(self._max_step_rotation_rad):.1f} deg"
+                f"to {np.rad2deg(self._max_step_rotation_rad):.1f} deg",
             )
             step = Rotation.from_rotvec(
                 delta_rotation.as_rotvec() * (self._max_step_rotation_rad / angle)

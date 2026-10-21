@@ -4,7 +4,9 @@ These tests run without hardware or the ``onero-sdk`` package: a mock arm is
 injected through the ``arm=`` constructor argument.
 """
 
+import logging
 import sys
+import time
 import types
 from dataclasses import dataclass, field
 
@@ -12,7 +14,10 @@ import numpy as np
 import pytest
 
 from beavr.teleop.components.interface.interface_types import CartesianState
-from beavr.teleop.components.interface.robots.onero_robot import OneroRobot
+from beavr.teleop.components.interface.robots.onero_robot import (
+    IKConvergenceError,
+    OneroRobot,
+)
 from beavr.teleop.configs.constants import robots
 
 
@@ -142,6 +147,32 @@ def test_move_coords_clamps_large_steps():
     assert target[0] == pytest.approx(0.35, abs=1e-9)
 
 
+def test_clamp_logging_is_throttled_to_one_line_per_window(caplog):
+    robot = _make_robot()
+
+    with caplog.at_level(logging.WARNING):
+        for _ in range(6):
+            robot._log_clamp("position", "onero_right: clamped 50.0 mm command step")
+
+    clamped = [r for r in caplog.records if "clamped" in r.getMessage()]
+    assert len(clamped) == 1
+
+
+def test_clamp_logging_reports_the_suppressed_count(caplog):
+    robot = _make_robot()
+
+    with caplog.at_level(logging.WARNING):
+        for _ in range(4):
+            robot._log_clamp("rotation", "onero_right: clamped 40.0 deg command step")
+        # Age the window so the next call flushes the counter.
+        robot._clamp_last_log["rotation"] = 0.0
+        robot._log_clamp("rotation", "onero_right: clamped 40.0 deg command step")
+
+    messages = [r.getMessage() for r in caplog.records if "clamped" in r.getMessage()]
+    assert len(messages) == 2
+    assert "[4 frames clamped]" in messages[1]
+
+
 def test_move_coords_rejects_malformed_command():
     arm = MockArm()
     robot = _make_robot(arm=arm)
@@ -149,6 +180,213 @@ def test_move_coords_rejects_malformed_command():
     robot.move_coords([0.1, 0.2, 0.3])
 
     assert arm.servop_calls == []
+
+
+class RaisingArm(MockArm):
+    """Mock arm whose servo call always raises, to exercise the hold paths."""
+
+    def __init__(self, exc):
+        super().__init__()
+        self._exc = exc
+
+    def servop(self, target, kp=None, kd=None, frame=None):
+        raise self._exc
+
+
+def _ik_error(message="IK did not converge"):
+    """Build an ``IKConvergenceError`` without depending on the SDK constructor.
+
+    The SDK requires the solver diagnostics (pos_err, iters, ...) while the
+    package-absent placeholder takes a plain message, so instantiate the type
+    and set the message directly.
+    """
+    exc = IKConvergenceError.__new__(IKConvergenceError)
+    Exception.__init__(exc, message)
+    return exc
+
+
+class FakeIKSolver:
+    """Stand-in for the SDK's ``PinkIKSolver``, recording the tolerances used."""
+
+    def __init__(self):
+        self.reset_calls = []
+        self.solve_calls = []
+
+    def reset(self, q, overshoot_tolerance=0.02):
+        self.reset_calls.append((list(q), overshoot_tolerance))
+
+    def solve(self, target_pos, target_rot=None, dt=0.005, max_iter=10,
+              pos_tol=1e-4, rot_tol=1e-3, return_info=False, strict=False):
+        self.solve_calls.append({"pos_tol": pos_tol, "rot_tol": rot_tol})
+        return [0.0] * robots.ONERO_JOINT_COUNT
+
+
+class ArmWithIK(MockArm):
+    """Mock arm exposing the SDK's cached IK solver hook."""
+
+    def __init__(self, ik):
+        super().__init__()
+        self._ik_solver = ik
+
+    def _get_ik(self):
+        return self._ik_solver
+
+
+class ReachLimitedArm(MockArm):
+    """Mock arm that refuses Cartesian targets outside a sphere, like the solver."""
+
+    def __init__(self, radius=0.6, position=(0.3, 0.0, 0.4)):
+        super().__init__(position=position)
+        self._radius = radius
+        self.attempts = []
+
+    def servop(self, target, kp=None, kd=None, frame=None):
+        target = np.asarray(target, dtype=float)
+        self.attempts.append(target)
+        if float(np.linalg.norm(target[:3])) > self._radius:
+            raise _ik_error()
+        self.servop_calls.append((target, frame))
+        self._position = target[:3].copy()
+        return self.state
+
+
+def test_move_coords_holds_when_feedback_exceeds_urdf_limit():
+    # Servo lag can push a joint a few milliradians past a hard limit while the
+    # arm runs at the edge of its workspace. One such tick must not take the arm
+    # down: hold the target and let the next tick recover.
+    arm = RaisingArm(
+        ValueError(
+            "IK feedback exceeds URDF limits by 0.020575 rad (tolerance 0.020000)"
+        )
+    )
+    robot = _make_robot(arm=arm)
+
+    assert robot.move_coords([0.3, 0.0, 0.4, 0.0, 0.0, 0.0, 1.0]) is None
+    assert robot._ik_failures == 1
+
+
+def test_move_coords_still_raises_unrelated_value_errors():
+    arm = RaisingArm(ValueError("Expected 7 joints, got shape (6,)"))
+    robot = _make_robot(arm=arm)
+
+    with pytest.raises(ValueError, match="Expected 7 joints"):
+        robot.move_coords([0.3, 0.0, 0.4, 0.0, 0.0, 0.0, 1.0])
+
+
+def test_unreachable_target_holds_in_place_then_recovers():
+    """One refused frame must hold the arm where it is, and the next must track.
+
+    A retry-with-a-smaller-step scheme used to live here. On real hardware it
+    made teleoperation unusable: the solver accepts a fraction of an unreachable
+    target, that accepted-but-unreachable pose becomes the next step-clamp
+    baseline, and every later step measured from it is refused as well -- the
+    arm then parks at the workspace edge and stops responding (measured: one
+    "holding at the limit" line per second for the rest of the session).
+    """
+    arm = ReachLimitedArm(radius=0.52)
+    robot = _make_robot(arm=arm, max_step_distance_m=0.05)
+    robot.move_coords([0.30, 0.0, 0.40, 0.0, 0.0, 0.0, 1.0])
+    baseline = robot._last_commanded_position.copy()
+
+    before = len(arm.attempts)
+    assert robot.move_coords([0.30, 0.0, 0.95, 0.0, 0.0, 0.0, 1.0]) is None
+
+    assert len(arm.attempts) - before == 1, "a refused frame must not retry"
+    np.testing.assert_allclose(robot._last_commanded_position, baseline)
+    assert robot._ik_failures == 1
+
+    # Hand back inside the workspace: the very next frame tracks again.
+    robot.move_coords([0.32, 0.0, 0.40, 0.0, 0.0, 0.0, 1.0])
+
+    assert robot._last_commanded_position[0] == pytest.approx(0.32, abs=0.005)
+    assert robot._ik_failures == 0
+
+
+def test_reset_clears_the_hold_counter():
+    """A reset re-baselines tracking, so a stale streak must not survive it."""
+    robot = _make_robot()
+    robot._ik_failures = 12
+    robot._ik_streak_started = time.time() - 30.0
+
+    robot.reset()
+
+    assert robot._ik_failures == 0
+    assert robot._ik_streak_started == 0.0
+
+
+def test_joint_limit_check_matches_the_tolerance_teleop_runs_with():
+    """The diagnostic must not disagree with the teleoperation it predicts."""
+    from beavr.scripts.check_onero_joint_limits import OVERSHOOT_TOLERANCE
+
+    robot = _make_robot()
+
+    assert OVERSHOOT_TOLERANCE == pytest.approx(robot._ik_limit_overshoot_rad)
+
+
+def test_ik_hold_log_reports_the_streak_duration(caplog):
+    robot = _make_robot()
+    robot._ik_failures = 5
+    robot._ik_streak_started = time.time() - 12.0
+    robot._ik_last_log = 0.0
+
+    with caplog.at_level(logging.WARNING):
+        robot._hold_on_ik_error(ValueError("boom"), "hint")
+
+    message = caplog.records[-1].getMessage()
+    assert "over 12." in message, message
+
+
+def test_joint_limit_overshoot_tolerance_is_widened_for_teleop():
+    """The SDK default (0.02 rad) deadlocks a real arm at the workspace edge.
+
+    Measured on the A1 cell: joints settle 0.030-0.034 rad past a URDF limit,
+    ``servop`` then refuses every target, and the arm cannot drive itself back
+    inside the limit -- 1741 consecutive refused frames over ~60 s.
+    """
+    ik = FakeIKSolver()
+    robot = _make_robot(arm=ArmWithIK(ik))
+
+    ik.reset([0.1] * robots.ONERO_JOINT_COUNT)
+
+    assert ik.reset_calls[0][1] == pytest.approx(robot._ik_limit_overshoot_rad)
+    assert ik.reset_calls[0][1] > 0.02
+
+
+def test_ik_convergence_tolerances_stay_at_the_sdk_defaults():
+    """Widening these makes an unreachable target count as solved.
+
+    The arm then records a pose it never reached as the next step-clamp
+    baseline, and every step measured from it is refused -- it parks at the
+    workspace edge.
+    """
+    ik = FakeIKSolver()
+    _make_robot(arm=ArmWithIK(ik))
+
+    ik.solve([0.3, 0.0, 0.4])
+
+    assert ik.solve_calls[0]["pos_tol"] == pytest.approx(1e-4)
+    assert ik.solve_calls[0]["rot_tol"] == pytest.approx(1e-3)
+
+
+def test_explicit_ik_tolerances_win_over_the_widened_defaults():
+    ik = FakeIKSolver()
+    _make_robot(arm=ArmWithIK(ik))
+
+    ik.solve([0.3, 0.0, 0.4], pos_tol=1e-6, rot_tol=1e-6)
+
+    assert ik.solve_calls[0]["pos_tol"] == pytest.approx(1e-6)
+    assert ik.solve_calls[0]["rot_tol"] == pytest.approx(1e-6)
+
+
+def test_ik_tolerance_widening_degrades_quietly_without_an_ik_extra():
+    class NoIKArm(MockArm):
+        def _get_ik(self):
+            raise RuntimeError("IK requires pinocchio and pink")
+
+    robot = _make_robot(arm=NoIKArm())
+
+    # Construction must not fail: without the IK extra there is nothing to widen.
+    assert robot._ik_failures == 0
 
 
 def test_move_delegates_to_sdk_movej():

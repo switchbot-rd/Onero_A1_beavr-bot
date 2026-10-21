@@ -3,15 +3,21 @@
 import time
 
 import numpy as np
+import pytest
 
-from beavr.teleop.components.detector.detector_types import InputFrame
+from beavr.teleop.components.detector.detector_types import InputFrame, SessionCommand
 from beavr.teleop.components.interface.interface_types import CartesianState
 from beavr.teleop.components.operator.operator_types import CartesianTarget
 from beavr.teleop.components.operator.robots.onero_operator import OneroOperator
 from beavr.teleop.configs.constants import robots
 
 
-def _make_operator(hand_side=robots.RIGHT, transformed_keypoints_port=5555, endeff_publish_port=10032):
+def _make_operator(
+    hand_side=robots.RIGHT,
+    transformed_keypoints_port=5555,
+    endeff_publish_port=10032,
+    teleoperation_state_port=None,
+):
     return OneroOperator(
         host="127.0.0.1",
         transformed_keypoints_port=transformed_keypoints_port,
@@ -22,7 +28,7 @@ def _make_operator(hand_side=robots.RIGHT, transformed_keypoints_port=5555, ende
         moving_average_limit=3,
         use_filter=False,
         arm_resolution_port=None,
-        teleoperation_state_port=None,
+        teleoperation_state_port=teleoperation_state_port,
         logging_config={"enabled": False},
         hand_side=hand_side,
     )
@@ -227,3 +233,227 @@ def test_calibration_pair_satisfies_the_pipeline_algebra():
         r_cmd = r_init @ h_r_v[:3, :3].T @ r_rel @ h_r_v[:3, :3]
         r_u = r_hand @ r_rel @ r_hand.T
         np.testing.assert_allclose(r_cmd, axis_map @ r_u @ axis_map.T @ r_init, atol=1e-9)
+
+
+# -----------------------------------------------------------------------------
+# Gripper trigger (thumb/pinky pinch -> two-state command)
+# -----------------------------------------------------------------------------
+def _hand(span_m: float) -> np.ndarray:
+    """Keypoints with the thumb and pinky tips ``span_m`` apart.
+
+    Both tips sit away from the origin so they are not mistaken for the untracked
+    (all-zero) joints the App streams when tracking drops.
+    """
+    keypoints = np.zeros((robots.OCULUS_NUM_KEYPOINTS, 3))
+    keypoints[OneroOperator._THUMB_TIP_IDX] = (0.0, 0.0, 0.40)
+    keypoints[OneroOperator._PINKY_TIP_IDX] = (span_m, 0.0, 0.40)
+    return keypoints
+
+
+def _feed(op, spans):
+    """Run samples through the classifier, applying the state like the loop does."""
+    decisions = []
+    for span in spans:
+        state = op._classify_pinch(span)
+        if state is not None:
+            op._gripper_is_closed = state
+        decisions.append(state)
+    return decisions
+
+
+def test_pinch_distance_measures_the_tip_span():
+    op = _make_operator()
+
+    assert op._pinch_distance(_hand(0.04)) == pytest.approx(0.04)
+
+
+def test_pinch_distance_rejects_a_frame_with_a_dropped_tip():
+    """A dropped joint streams as the origin; the span would read as 0.4 m.
+
+    That bogus "fingers far apart" reading is what opened the gripper mid-pinch
+    whenever headset tracking lost a fingertip while the hand was moving.
+    """
+    op = _make_operator()
+    keypoints = _hand(0.02)
+    keypoints[OneroOperator._PINKY_TIP_IDX] = (0.0, 0.0, 0.0)
+
+    assert op._pinch_distance(keypoints) is None
+
+
+def test_pinch_distance_rejects_an_untracked_hand():
+    op = _make_operator()
+
+    assert op._pinch_distance(np.zeros((robots.OCULUS_NUM_KEYPOINTS, 3))) is None
+
+
+def test_gripper_ignores_a_single_wide_frame_while_closed():
+    """One jittery frame must not drop what the gripper is holding."""
+    op = _make_operator()
+    op._gripper_is_closed = True
+
+    decisions = _feed(op, [0.02, 0.02, 0.02, 0.09, 0.02, 0.02])
+
+    assert decisions == [None] * 6
+    assert op._gripper_is_closed is True
+
+
+def test_gripper_opens_after_a_sustained_spread():
+    op = _make_operator()
+    op._gripper_is_closed = True
+    _feed(op, [0.02, 0.02, 0.02])
+
+    decisions = _feed(op, [0.09] * 5)
+
+    assert decisions[0] is None, "one wide frame is not enough"
+    assert next(d for d in decisions if d is not None) is False
+    assert op._gripper_is_closed is False
+
+
+def test_gripper_closes_after_a_sustained_pinch():
+    op = _make_operator()
+
+    decisions = _feed(op, [0.02] * 4)
+
+    assert next(d for d in decisions if d is not None) is True
+    assert op._gripper_is_closed is True
+
+
+class _StubSubscriber:
+    """Serves one fixed keypoint frame, like the cached detector subscriber."""
+
+    def __init__(self, frame):
+        self._frame = frame
+
+    def recv_keypoints(self):
+        return self._frame
+
+
+class _RecordingPublisher:
+    def __init__(self):
+        self.commands = []
+
+    def publish(self, **kwargs):
+        self.commands.append(kwargs["data"].command)
+
+
+def test_update_gripper_publishes_only_after_the_debounce():
+    """End to end through ``_update_gripper``: jitter must send nothing."""
+    op = _make_operator()
+    publisher = _RecordingPublisher()
+    op._gripper_publisher = publisher
+    op._gripper_command_port = 10040
+    op._gripper_is_closed = True
+
+    def feed(span, frames=1):
+        op._raw_keypoints_subscriber = _StubSubscriber(
+            InputFrame(
+                timestamp_s=time.time(),
+                hand_side=robots.RIGHT,
+                keypoints=_hand(span).tolist(),
+                is_relative=False,
+            )
+        )
+        for _ in range(frames):
+            op._update_gripper()
+
+    feed(0.02, frames=3)  # sustained pinch, already closed
+    feed(0.09, frames=1)  # one jittery frame
+    assert publisher.commands == []
+
+    feed(0.09, frames=3)  # sustained spread
+    assert publisher.commands == ["open"]
+
+
+def test_gripper_does_not_oscillate_inside_the_hysteresis_band():
+    """A hand resting between the thresholds must hold its state."""
+    op = _make_operator()
+    op._gripper_is_closed = True
+    inside = (op._PINCH_CLOSE_M + op._PINCH_OPEN_M) / 2
+
+    decisions = _feed(op, [inside] * 10)
+
+    assert decisions == [None] * 10
+    assert op._gripper_is_closed is True
+
+
+def test_gripper_closes_at_the_span_a_rotated_palm_reports():
+    """Tracking over-reports the tip gap when the palm faces away from the headset.
+
+    Real pinches were measured around 0.04 m, above the old 0.03 m close
+    threshold, so those angles never closed at all.
+    """
+    op = _make_operator()
+
+    decisions = _feed(op, [0.04] * 3)
+
+    assert next(d for d in decisions if d is not None) is True
+    assert op._gripper_is_closed is True
+
+
+def test_gripper_stays_open_on_a_resting_hand():
+    """A relaxed hand measures 0.08-0.10 m; the wider band must not close on it."""
+    op = _make_operator()
+
+    decisions = _feed(op, [0.09] * 6)
+
+    assert decisions == [None] * 6
+    assert op._gripper_is_closed is False
+
+
+# ---------------------------------------------------------------------------------
+# Start gate
+# ---------------------------------------------------------------------------------
+
+
+def _publish_pause(bus, port, command, timestamp_s):
+    bus.publish(
+        "127.0.0.1",
+        port,
+        robots.PAUSE,
+        SessionCommand(timestamp_s=timestamp_s, command=command),
+    )
+
+
+def test_start_gate_holds_until_the_app_presses_start(bus, monkeypatch):
+    """The App pushes keypoints before Start; the gate must still hold the arm.
+
+    Nothing may be published, and just as important the inherited reset must not
+    run: it blocks until a hand frame arrives and rebaselines the hand-to-arm
+    mapping, so running it on the menu screen both stalls the operator and
+    captures a baseline nobody intended.
+    """
+    monkeypatch.setenv("ONERO_REQUIRE_START", "1")
+    op = _make_operator(teleoperation_state_port=10050)
+    assert op.arm_teleop_state == robots.ARM_TELEOP_STOP
+
+    # Menu screen: the detector republishes the App's "Low" as "resume".
+    for index in range(3):
+        _publish_pause(bus, 10050, robots.RESUME, 1.0 + index)
+        op._apply_retargeted_angles()
+
+    assert op.arm_teleop_state == robots.ARM_TELEOP_STOP
+    assert op.is_first_frame is True
+    assert bus.recv_latest(10032, "endeff_coords") is None
+
+
+def test_start_gate_opens_on_the_continue_code(bus, monkeypatch):
+    """The App's "High" arrives as "pause"; that is the one code that starts teleop."""
+    monkeypatch.setenv("ONERO_REQUIRE_START", "1")
+    op = _make_operator(teleoperation_state_port=10050)
+
+    flange = _rot_x(np.deg2rad(35.0))
+    hand = np.diag([-1.0, 1.0, -1.0])
+    _publish_robot_pose(bus, 10031, flange)
+    _publish_hand_frame(bus, 5555, hand)
+
+    _publish_pause(bus, 10050, robots.RESUME, 1.0)
+    op._apply_retargeted_angles()
+    assert op.is_first_frame is True
+    assert bus.recv_latest(10032, "endeff_coords") is None
+
+    _publish_pause(bus, 10050, robots.PAUSE, 2.0)
+    op._apply_retargeted_angles()
+
+    assert op.arm_teleop_state == robots.ARM_TELEOP_CONT
+    assert op.is_first_frame is False
+    assert bus.recv_latest(10032, "endeff_coords") is not None
