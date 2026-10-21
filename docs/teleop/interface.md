@@ -45,20 +45,19 @@ three, or the arm will not start, or will not track correctly:
 | Value | Read by | How to set it |
 |---|---|---|
 | CAN interface name | `OneroRobotCfg.can_channel` | `ONERO_CAN_CHANNEL=slcan0`, and `ONERO_LEFT_CAN_CHANNEL` for the left arm |
-| Network host | every component's `host` | `HOST_ADDRESS` in `configs/constants/network.py` |
+| Network host | every component's `host` | `BEAVR_HOST_ADDRESS=10.8.80.204` (read in `configs/constants/network.py`) |
 | Loop rate | every component's timer | `VR_FREQ` in `configs/constants/robots.py` |
 
-Note how the first row differs from the other two: only the CAN interface has a
-real override. **There is currently no configuration route for the network host or
-the loop rate.** `--teleop.network.host_address` and `--teleop.control.vr_freq` are
-parsed, validated and logged, and then ignored, because the components read those
-constants directly rather than their own config; `configs/environment/*.yaml`
-carries a `host_address` as well, but the teleop entry point does not read it
-either. Editing the constants is the only working route until that is wired up,
-which is a repository-wide fix rather than an A1 one.
+The host address must be an address that exists on the machine running teleop,
+because publishers bind `tcp://*:<port>` while every subscriber connects to that
+address, and the headset app talks to the same address. When it names an
+unreachable address the failure is silent (see Troubleshooting), so set it
+explicitly rather than relying on the default captured from the validated cell.
 
-A single-machine setup needs `HOST_ADDRESS = "127.0.0.1"`. When it names an
-unreachable address the failure is silent — see Troubleshooting.
+`--teleop.network.host_address` and `--teleop.control.vr_freq` are parsed,
+validated and logged, and then ignored: the components read the constants
+directly rather than their own config. Environment variables are the working
+route.
 
 The remaining notes are about correctness rather than startup:
 
@@ -91,9 +90,24 @@ The remaining notes are about correctness rather than startup:
   from its servo entry points; per-joint support there is the actual fix.
 - Model, mounting and world-frame options live in `configs/robots/onero_config.py`
   (`OneroRobotCfg`) and in `configs/constants/robots.py`.
-- The VR→robot calibration matrices in
-  `beavr/teleop/components/operator/robots/onero_operator.py` are placeholders
-  seeded from the xArm7 setup and **must be re-calibrated on the real cell**.
+- **The VR→robot calibration is derived at teleop reset, not configured.**
+  `OneroOperator._reset_teleop()` solves, from the two baselines the reset
+  captures (flange pose and hand frame), the matrix that makes the command map
+  equal the fixed Unity→A1 axis map (x right / y up / z forward → X forward /
+  Y left / Z up). Both `H_R_V` and `H_T_V` receive that one matrix; the module
+  constants in `onero_operator.py` are only the pre-reset values. Consequences
+  worth knowing before touching them:
+  - The map no longer depends on where the arm happens to start, nor on how the
+    hand is held at reset. Hard-coding a matrix instead (the xArm7 approach)
+    makes the direction map rotate with the flange orientation at reset, which
+    fails silently: with the xArm7 placeholders on an A1 cell, moving the hand up
+    commanded the arm backwards.
+  - The commanded orientation at reset equals the measured flange orientation,
+    so the first command never asks the arm to slew. Blanking the baseline
+    rotation -- the obvious way to make the map pose independent -- does ask for
+    exactly that, by 0.96 in the measured case, and is wrong for that reason.
+  - Rotation is composed in the world frame: a hand yaw turns the tool about the
+    vertical.
 
 #### Safety notes
 

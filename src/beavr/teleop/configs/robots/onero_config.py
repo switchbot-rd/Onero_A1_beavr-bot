@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from beavr.teleop.common.configs.loader import Laterality, log_laterality_configuration
+from beavr.teleop.components.detector.vr.onero_oculus import OneroVRHandDetector
 from beavr.teleop.components.interface.robots.onero_robot import OneroRobot
 
 # Import shared constants and utilities
@@ -18,7 +19,10 @@ from beavr.teleop.configs.constants import network, ports, robots
 from beavr.teleop.configs.robots import TeleopRobotConfig
 
 # Import shared component configurations
-from beavr.teleop.configs.robots.shared_components import SharedComponentRegistry
+from beavr.teleop.configs.robots.shared_components import (
+    SharedComponentRegistry,
+    UnifiedOculusVRHandDetectorCfg,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +38,11 @@ class OneroRobotCfg:
     # the modelled gravity torque by up to 5.3x (J5) / 2.8x (J3). Keep False only
     # for a bare flange, otherwise the joints sag under load.
     with_gripper: bool = False
+    # Onero's own gripper (commands on CAN id 0x08, feedback 0x18) shares the arm
+    # bus. Enabling it attaches a *controllable* effector -- ``with_gripper`` only
+    # scales the gravity model and cannot move anything.
+    gripper_enabled: bool = True
+    gripper_command_port: int = 10040  # +2 for the left arm
     is_right_arm: bool = True  # Overridden based on laterality
     endeff_publish_port: int = ports.ONERO_ENDEFF_PUBLISH_PORT
     endeff_subscribe_port: int = ports.ONERO_ENDEFF_SUBSCRIBE_PORT
@@ -135,6 +144,8 @@ class OneroRobotCfg:
             mounting=self.mounting,
             world_frame=self.world_frame,
             with_gripper=self.with_gripper,
+            gripper_enabled=self.gripper_enabled,
+            gripper_command_port=self.gripper_command_port,
             is_right_arm=self.is_right_arm,
             endeff_publish_port=self.endeff_publish_port,
             endeff_subscribe_port=self.endeff_subscribe_port,
@@ -167,7 +178,10 @@ class OneroOperatorCfg:
     moving_average_limit: int = 3
     arm_resolution_port: int = ports.KEYPOINT_STREAM_PORT
     use_filter: bool = False
-    teleoperation_state_port: int = ports.ONERO_TELEOPERATION_STATE_PORT
+    # Carries the App's start/stop signal, which the detector republishes on its
+    # keypoint port. 10038 (ONERO_TELEOPERATION_STATE_PORT) has no publisher on this
+    # rig, which is why the operator used to sit in CONT from the first frame.
+    teleoperation_state_port: int = ports.KEYPOINT_STREAM_PORT
     logging_config: dict[str, Any] = field(
         default_factory=lambda: {
             "enabled": False,
@@ -177,6 +191,9 @@ class OneroOperatorCfg:
         }
     )
     hand_side: str = robots.RIGHT  # Overridden based on laterality
+    # Port the operator publishes two-state gripper commands on. None disables the
+    # operator side of the chain (the robot then never receives a command).
+    gripper_command_port: Optional[int] = None
 
     def __post_init__(self):
         """Validate configuration."""
@@ -211,7 +228,31 @@ class OneroOperatorCfg:
             teleoperation_state_port=self.teleoperation_state_port,
             logging_config=self.logging_config,
             hand_side=self.hand_side,
+            gripper_command_port=self.gripper_command_port,
         )
+
+
+@dataclass
+class OneroDetectorCfg(UnifiedOculusVRHandDetectorCfg):
+    """Detector config that builds the Onero frame-validating detector.
+
+    Everything else is inherited, so the ports and hand routing stay identical to
+    the shared configuration; only the parser is specialised.
+    """
+
+    def build(self):
+        kwargs = {
+            "host": self.host,
+            "oculus_pub_port": self.oculus_pub_port,
+            "button_port": self.button_port,
+            "teleop_reset_port": self.teleop_reset_port,
+            "hand_config": self.hand_config,
+        }
+        if self.hand_config in [robots.RIGHT, robots.BIMANUAL]:
+            kwargs["right_hand_port"] = ports.RIGHT_HAND_OCULUS_RECEIVER_PORT
+        if self.hand_config in [robots.LEFT, robots.BIMANUAL]:
+            kwargs["left_hand_port"] = ports.LEFT_HAND_OCULUS_RECEIVER_PORT
+        return OneroVRHandDetector(**kwargs)
 
 
 @dataclass
@@ -238,14 +279,19 @@ class OneroA1Config:
         self.detector = []
         if self.laterality == Laterality.BIMANUAL:
             self.detector.append(
-                SharedComponentRegistry.get_bimanual_detector_config(host=network.HOST_ADDRESS)
+                OneroDetectorCfg(
+                    host=network.HOST_ADDRESS,
+                    hand_config=robots.BIMANUAL,
+                    hand_side="bimanual",
+                )
             )
         else:
             hand_side = robots.RIGHT if self.laterality == Laterality.RIGHT else robots.LEFT
             self.detector.append(
-                SharedComponentRegistry.get_detector_config(
-                    hand_side=hand_side,
+                OneroDetectorCfg(
                     host=network.HOST_ADDRESS,
+                    hand_config=hand_side,
+                    hand_side=hand_side,
                 )
             )
 
@@ -297,6 +343,8 @@ class OneroA1Config:
                     model=robots.ONERO_DEFAULT_MODEL,
                     mounting=robots.ONERO_DEFAULT_MOUNTING,
                     with_gripper=robots.ONERO_DEFAULT_WITH_GRIPPER,
+                    gripper_enabled=robots.ONERO_DEFAULT_WITH_GRIPPER,
+                    gripper_command_port=10040,
                     is_right_arm=True,
                     endeff_publish_port=ports.ONERO_ENDEFF_PUBLISH_PORT,
                     endeff_subscribe_port=ports.ONERO_ENDEFF_SUBSCRIBE_PORT,
@@ -304,6 +352,7 @@ class OneroA1Config:
                     reset_subscribe_port=ports.ONERO_RESET_SUBSCRIBE_PORT,
                     home_subscribe_port=ports.ONERO_HOME_SUBSCRIBE_PORT,
                     state_publish_port=ports.ONERO_STATE_PUBLISH_PORT,
+                    # See the operator note: pause is intentionally left inert.
                     teleoperation_state_port=ports.ONERO_TELEOPERATION_STATE_PORT,
                     hand_side=robots.RIGHT,
                     recorder_config={
@@ -325,6 +374,8 @@ class OneroA1Config:
                     model=robots.ONERO_LEFT_DEFAULT_MODEL,
                     mounting=robots.ONERO_LEFT_DEFAULT_MOUNTING,
                     with_gripper=robots.ONERO_DEFAULT_WITH_GRIPPER,
+                    gripper_enabled=robots.ONERO_DEFAULT_WITH_GRIPPER,
+                    gripper_command_port=10042,
                     is_right_arm=False,
                     endeff_publish_port=ports.ONERO_ENDEFF_PUBLISH_PORT + 2,
                     endeff_subscribe_port=ports.ONERO_ENDEFF_SUBSCRIBE_PORT + 2,
@@ -332,7 +383,7 @@ class OneroA1Config:
                     reset_subscribe_port=ports.ONERO_RESET_SUBSCRIBE_PORT + 2,
                     home_subscribe_port=ports.ONERO_HOME_SUBSCRIBE_PORT,
                     state_publish_port=ports.ONERO_STATE_PUBLISH_PORT + 2,
-                    teleoperation_state_port=ports.ONERO_TELEOPERATION_STATE_PORT,
+                    teleoperation_state_port=ports.ONERO_TELEOPERATION_STATE_PORT,  # see right arm note
                     hand_side=robots.LEFT,
                     recorder_config={
                         "robot_identifier": robots.ROBOT_IDENTIFIER_LEFT_ONERO,
@@ -358,8 +409,14 @@ class OneroA1Config:
                     moving_average_limit=3,
                     arm_resolution_port=ports.KEYPOINT_STREAM_PORT,
                     use_filter=False,
-                    teleoperation_state_port=ports.ONERO_TELEOPERATION_STATE_PORT,
+                    # Point the pause subscriber at the detector's keypoint port:
+                    # that is where the App's start/stop signal is republished on
+                    # topic "pause". OneroOperator compensates for the detector's
+                    # inverted codes and boots in STOP, so teleop now waits for the
+                    # App's Start button instead of tracking as soon as it launches.
+                    teleoperation_state_port=ports.KEYPOINT_STREAM_PORT,
                     hand_side=robots.RIGHT,
+                    gripper_command_port=10040,
                     logging_config={
                         "enabled": False,
                         "log_dir": "logs",
@@ -378,8 +435,9 @@ class OneroA1Config:
                     moving_average_limit=3,
                     arm_resolution_port=ports.KEYPOINT_STREAM_PORT,
                     use_filter=False,
-                    teleoperation_state_port=ports.ONERO_TELEOPERATION_STATE_PORT,
+                    teleoperation_state_port=ports.KEYPOINT_STREAM_PORT,  # see right arm note
                     hand_side=robots.LEFT,
+                    gripper_command_port=10042,
                     logging_config={
                         "enabled": False,
                         "log_dir": "logs",

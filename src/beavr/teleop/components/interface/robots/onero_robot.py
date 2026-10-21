@@ -45,6 +45,14 @@ from beavr.teleop.components.interface.interface_types import (
 from beavr.teleop.components.operator.operator_types import CartesianTarget
 from beavr.teleop.configs.constants import ports, robots
 
+try:  # onero-sdk is imported lazily elsewhere; keep module import hardware-free
+    from onero_sdk.exceptions import IKConvergenceError
+except Exception:  # pragma: no cover - SDK absent (tests, dry runs)
+
+    class IKConvergenceError(Exception):
+        """Placeholder so the servo guard stays valid without the SDK."""
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -73,6 +81,8 @@ class OneroRobot(RobotWrapper):
         mounting: Optional[str] = None,
         world_frame: bool = True,
         with_gripper: bool = False,
+        gripper_enabled: bool = False,
+        gripper_command_port: Optional[int] = None,
         is_right_arm: bool = True,
         endeff_publish_port: int = ports.ONERO_ENDEFF_PUBLISH_PORT,
         state_publish_port: int = ports.ONERO_STATE_PUBLISH_PORT,
@@ -152,6 +162,20 @@ class OneroRobot(RobotWrapper):
         self._mounting = mounting
         self._world_frame = world_frame
         self._with_gripper = with_gripper
+        # Set before _create_arm() runs: that call decides whether to attach the
+        # effector object, and the SDK arm must know about it at construction time.
+        self._gripper_enabled = bool(gripper_enabled)
+        self._gripper_is_closed = False
+        self._gripper_failures = 0
+        # The A1 gripper shares the arm's CAN transport and I/O lock, and its
+        # transaction waits up to the feedback timeout (50 ms) while the bus
+        # reader discards every non-0x18 frame -- i.e. all seven motor feedback
+        # frames. Retrying a failing command on every 100 Hz servo tick therefore
+        # starves the servo of feedback and freezes the arm, which looks exactly
+        # like "teleop hangs the moment I pinch". Back off between attempts.
+        self._gripper_retry_after = 0.0
+        self._gripper_retry_interval_s = 1.0
+        self._gripper_command_port = gripper_command_port
         self._is_right_arm = is_right_arm
         self._command_frame = command_frame
         self._stiffness = stiffness
@@ -168,6 +192,12 @@ class OneroRobot(RobotWrapper):
         self._max_step_rotation_rad = max_step_rotation_rad
         self._kp = kp
         self._kd = kd
+        # Consecutive IK failures. The SDK servo path raises when its internal
+        # solver cannot reach the target in the allotted iterations; a single
+        # unreachable frame must never take the whole component down.
+        self._ik_failures = 0
+        self._ik_last_log = 0.0
+        self._nonfinite_commands = 0
         self._data_frequency = robots.VR_FREQ
         self._recorder_config = kwargs.get("recorder_config", {})
         self.robot_identifier = self._recorder_config.get("robot_identifier", self.name)
@@ -209,6 +239,19 @@ class OneroRobot(RobotWrapper):
             "home": self._home_subscriber,
             "teleop_state": self._arm_teleop_state_subscriber.get_arm_teleop_state,
         }
+
+        # Gripper --------------------------------------------------------------------
+        # Two-state only ("open" / "close"): the App never transmits a grasp
+        # amount, so the operator derives the state from the thumb/index distance
+        # and sends a discrete command. Nothing here is proportional on purpose.
+        self._gripper_subscriber = None
+        if self._gripper_enabled and gripper_command_port is not None:
+            self._gripper_subscriber = ZMQSubscriber(
+                host=host,
+                port=gripper_command_port,
+                topic="gripper",
+                message_type=SessionCommand,
+            )
 
         # Publishers ------------------------------------------------------------------
         self._publisher_manager = ZMQPublisherManager.get_instance()
@@ -252,12 +295,24 @@ class OneroRobot(RobotWrapper):
                 "Install it with: pip install onero-sdk"
             ) from exc
 
+        end_effector = None
+        if self._gripper_enabled:
+            # The A1 gripper shares the arm's CAN bus and answers on 0x08 (commands)
+            # / 0x18 (feedback); the SDK binds it to the arm's bus when no bus is
+            # passed. ``with_gripper`` alone only scales the gravity model, it does
+            # NOT create a controllable effector -- that needs this object.
+            from onero_sdk.grippers import OneroGripper
+
+            end_effector = OneroGripper(model=self._model)
+            logger.info(f"{self.name}: gripper enabled ({type(end_effector).__name__})")
+
         arm = Arm(
             self._model,
             channel=self._can_channel,
             mounting=self._mounting,
             world_frame=self._world_frame,
             with_gripper=self._with_gripper,
+            end_effector=end_effector,
         )
         # Planned motions (movej/movel/movec) take their gains from the SDK's
         # adaptive GainPolicy, not from the flat kp/kd the servo path uses.
@@ -438,6 +493,23 @@ class OneroRobot(RobotWrapper):
         # ``home()`` is intentionally not called here; the teleop reset only
         # re-baselines the operator, it must not command a motion by itself.
         self._latest_commanded_cartesian_position = None
+
+        # Seed the step clamp from the *measured* pose instead of leaving it
+        # empty. An empty baseline disables clamping on the very first command
+        # after a reset, so a large first target used to be handed straight to
+        # the solver -- exactly the case where a 10-iteration IK fails and, before
+        # the guard above, killed the component.
+        try:
+            measured = self.get_cartesian_position()
+        except Exception as exc:  # state not ready yet
+            logger.warning(f"{self.name}: could not read pose at reset ({exc})")
+            measured = None
+        if measured is None:
+            self._last_commanded_position = None
+            self._last_commanded_rotvec = None
+        else:
+            self._last_commanded_position = np.asarray(measured[:3], dtype=float)
+            self._last_commanded_rotvec = np.asarray(measured[3:], dtype=float)
         return state is not None
 
     # ---------------------------------------------------------------------------------
@@ -551,6 +623,80 @@ class OneroRobot(RobotWrapper):
         )
         self.home()
 
+    def _update_gripper(self):
+        """Apply the latest two-state gripper command, if one changed.
+
+        Deliberately isolated from the servo path: a gripper that does not answer
+        (unpowered, wrong CAN id, shared-bus contention) must never take the
+        tracking loop down with it.
+        """
+        if self._gripper_subscriber is None:
+            return
+
+        # Read once: ``recv_keypoints`` hands back the cached latest frame and
+        # never clears it, so a "loop until None" never terminates once traffic
+        # exists -- that would stall the servo loop exactly like it stalled the
+        # operator loop.
+        msg = self._gripper_subscriber.recv_keypoints()
+        command = getattr(msg, "command", None) if msg is not None else None
+        if command not in ("open", "close"):
+            return
+
+        want_closed = command == "close"
+        if want_closed == self._gripper_is_closed:
+            return
+
+        # Back-off window: see the note in __init__. Without it every servo tick
+        # retries a failing exchange and eats the arm's feedback frames.
+        now = time.time()
+        if now < self._gripper_retry_after:
+            return
+
+        gripper = getattr(self._arm, "gripper", None)
+        if gripper is None:
+            if self._gripper_failures == 0:
+                logger.warning(
+                    f"{self.name}: gripper command received but no effector is attached"
+                )
+            self._gripper_failures += 1
+            self._gripper_retry_after = now + self._gripper_retry_interval_s
+            return
+
+        started = time.monotonic()
+        try:
+            if want_closed:
+                gripper.grasp()
+            else:
+                gripper.open()
+        except Exception as exc:
+            elapsed_ms = (time.monotonic() - started) * 1000.0
+            self._gripper_failures += 1
+            self._gripper_retry_after = time.time() + self._gripper_retry_interval_s
+            if self._gripper_failures == 1 or self._gripper_failures % 20 == 0:
+                logger.warning(
+                    f"{self.name}: gripper {command} failed after {elapsed_ms:.1f} ms "
+                    f"({self._gripper_failures}x, retrying every "
+                    f"{self._gripper_retry_interval_s:.0f}s): "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            return
+
+        elapsed_ms = (time.monotonic() - started) * 1000.0
+        self._gripper_failures = 0
+        self._gripper_retry_after = 0.0
+        self._gripper_is_closed = want_closed
+        logger.info(
+            f"{self.name}: gripper {'closed' if want_closed else 'open'} "
+            f"({elapsed_ms:.1f} ms)"
+        )
+        if elapsed_ms > 20.0:
+            # Anything past a couple of servo ticks means the exchange stalled on a
+            # missing reply and the arm lost feedback meanwhile.
+            logger.warning(
+                f"{self.name}: gripper transaction held the shared CAN bus for "
+                f"{elapsed_ms:.1f} ms -- expect a visible tracking hitch"
+            )
+
     def stream(self):
         """Main control loop: consume operator commands and drive the arm."""
         self._startup_home()
@@ -577,6 +723,8 @@ class OneroRobot(RobotWrapper):
             if self.check_reset():
                 self.send_robot_pose()
 
+            self._update_gripper()
+
             if self.get_teleop_state() == robots.ARM_TELEOP_STOP:
                 # Paused: keep publishing state so observers stay in sync.
                 self.publish_current_state()
@@ -586,10 +734,27 @@ class OneroRobot(RobotWrapper):
             if msg is not None:
                 position = np.asarray(msg.position_m, dtype=np.float32)
                 orientation = np.asarray(msg.orientation_xyzw, dtype=np.float32)
-                self._latest_commanded_cartesian_position = np.concatenate([position, orientation])
-                self._latest_commanded_cartesian_timestamp = msg.timestamp_s
-                self._latest_cartesian_coords = position.copy()
-                self._latest_cartesian_state_timestamp = msg.timestamp_s
+                # The upstream chain yields all-NaN commands whenever the headset
+                # streams untracked (all-zero) joints: the transform normalises a
+                # zero vector and the operator propagates the NaN through. Feeding
+                # that to the solver fails on every tick and used to spray one
+                # "out of reach" warning per second forever, which is misleading.
+                # Drop such frames here instead of storing them as the last target.
+                if not (np.isfinite(position).all() and np.isfinite(orientation).all()):
+                    self._nonfinite_commands += 1
+                    if self._nonfinite_commands == 1 or self._nonfinite_commands % 300 == 0:
+                        logger.warning(
+                            f"{self.name}: dropping non-finite target "
+                            f"({self._nonfinite_commands} so far). Headset is "
+                            "likely streaming untracked hands -- check the pinch/"
+                            "hand tracking, this is not an out-of-reach target."
+                        )
+                else:
+                    self._nonfinite_commands = 0
+                    self._latest_commanded_cartesian_position = np.concatenate([position, orientation])
+                    self._latest_commanded_cartesian_timestamp = msg.timestamp_s
+                    self._latest_cartesian_coords = position.copy()
+                    self._latest_cartesian_state_timestamp = msg.timestamp_s
 
             if self._latest_commanded_cartesian_position is not None:
                 self.move_coords(self._latest_commanded_cartesian_position)
@@ -609,20 +774,52 @@ class OneroRobot(RobotWrapper):
         position = pose6[:3]
         rotvec = pose6[3:]
 
+        # Last line of defence: a NaN/Inf target can never be solved, and passing
+        # one to the SDK produces the misleading "out of reach" warning on every
+        # tick. Refuse it before clamping (comparisons against NaN are all False).
+        if not (np.isfinite(position).all() and np.isfinite(rotvec).all()):
+            return None
+
         # Per-cycle clamping keeps a dropped/glitched VR frame from producing a
         # large jerky motion. The SDK applies its own joint-space safety limits
         # on top of this.
         clamped_position, clamped_rotvec = self._clamp_step(position, rotvec)
         target = np.concatenate([clamped_position, clamped_rotvec]).tolist()
 
+        # A frame whose target is unreachable (hand driven into the table, past a
+        # joint limit, or simply too far in one step) makes the SDK solver raise.
+        # Swallow it, hold the previous target and keep the loop alive: the solver
+        # restarts from the measured joints every tick, so tracking resumes by
+        # itself as soon as the target is reachable again. Never publish the
+        # unconverged joint solution -- it is a local optimum, not a safe pose.
+        try:
+            state = self._arm.servop(
+                target,
+                kp=self._kp,
+                kd=self._kd,
+                frame=self._command_frame,
+            )
+        except IKConvergenceError as exc:
+            self._ik_failures += 1
+            now = time.time()
+            if now - self._ik_last_log > 1.0:  # throttle: one line per second
+                self._ik_last_log = now
+                logger.warning(
+                    f"{self.name}: IK failed on {self._ik_failures} consecutive "
+                    f"frame(s), holding last target ({exc}). Target may be out of "
+                    "reach -- move the hand back into the workspace."
+                )
+            return None
+
+        if self._ik_failures:
+            logger.info(
+                f"{self.name}: IK recovered after {self._ik_failures} failed frame(s)"
+            )
+            self._ik_failures = 0
+
         self._last_commanded_position = clamped_position
         self._last_commanded_rotvec = clamped_rotvec
-        return self._arm.servop(
-            target,
-            kp=self._kp,
-            kd=self._kd,
-            frame=self._command_frame,
-        )
+        return state
 
     def _clamp_step(self, position: np.ndarray, rotvec: np.ndarray):
         last_position = getattr(self, "_last_commanded_position", None)
@@ -639,14 +836,23 @@ class OneroRobot(RobotWrapper):
             )
             position = last_position + position_delta * (self._max_step_distance_m / distance)
 
-        rotation_delta = rotvec - last_rotvec
-        angle = float(np.linalg.norm(rotation_delta))
+        # Rotation must be compared as a *relative rotation*, not by subtracting
+        # two rotation vectors. Near +-180 deg the axis of a rotation vector flips,
+        # so a ~70 deg motion reads as ~290 deg and tripped this limiter on almost
+        # every frame. That is the difference that made the left arm stutter while
+        # the right one tracked cleanly.
+        previous_rotation = Rotation.from_rotvec(last_rotvec)
+        delta_rotation = Rotation.from_rotvec(rotvec) * previous_rotation.inv()
+        angle = float(delta_rotation.magnitude())  # shortest angle, in [0, pi]
         if angle > self._max_step_rotation_rad > 0:
             logger.warning(
                 f"{self.name}: clamped {np.rad2deg(angle):.1f} deg command step "
                 f"to {np.rad2deg(self._max_step_rotation_rad):.1f} deg"
             )
-            rotvec = last_rotvec + rotation_delta * (self._max_step_rotation_rad / angle)
+            step = Rotation.from_rotvec(
+                delta_rotation.as_rotvec() * (self._max_step_rotation_rad / angle)
+            )
+            rotvec = (step * previous_rotation).as_rotvec()
 
         return position, rotvec
 
